@@ -10,8 +10,9 @@ from queue import Queue
 def print_banner():
     print(colored("""
 ╔═══════════════════════════════════════════════════╗
-║         SCYFIX DIRECTORY SCANNER v2.0             ║
-║      Web Directory & Path Discovery Tool          ║
+║         SCYFIX DIRECTORY SCANNER v2.1             ║
+║   Web Directory & Path Discovery Tool             ║
+║      Now with SPA False Positive Detection        ║
 ╚═══════════════════════════════════════════════════╝
 """, 'cyan'))
 
@@ -20,6 +21,8 @@ found_directories = []
 lock = threading.Lock()
 progress_count = 0
 total_count = 0
+baseline_length = None
+baseline_body = None
 
 # ─── NORMALIZE URL ────────────────────────────────────────────
 def normalize_url(url):
@@ -28,8 +31,46 @@ def normalize_url(url):
         url = 'http://' + url
     return url.rstrip('/')
 
+# ─── GET BASELINE ─────────────────────────────────────────────
+def get_baseline(target_url):
+    global baseline_length, baseline_body
+    print(colored("\n[*] Fetching baseline response for false positive detection...", 'cyan'))
+    try:
+        # Request a random path that definitely doesn't exist
+        fake_url = target_url + '/scyfix_baseline_check_xyz_12345'
+        response = requests.get(fake_url, timeout=5, allow_redirects=False)
+        baseline_length = len(response.content)
+        baseline_body = response.text[:500]
+        print(colored(f"  [+] Baseline status code: {response.status_code}", 'green'))
+        print(colored(f"  [+] Baseline response length: {baseline_length} bytes", 'green'))
+        if response.status_code == 200:
+            print(colored("  [!] Target returns 200 for non-existent paths -- SPA detected", 'yellow'))
+            print(colored("  [!] False positive filtering enabled", 'yellow'))
+        return response.status_code
+    except Exception as e:
+        print(colored(f"  [-] Could not fetch baseline: {e}", 'red'))
+        return None
+
+# ─── IS FALSE POSITIVE ────────────────────────────────────────
+def is_false_positive(response):
+    if baseline_length is None:
+        return False
+
+    response_length = len(response.content)
+    length_diff = abs(response_length - baseline_length)
+
+    # If response length is within 50 bytes of baseline it's likely a false positive
+    if length_diff < 50:
+        return True
+
+    # If response body starts the same as baseline it's likely the same page
+    if baseline_body and response.text[:500] == baseline_body:
+        return True
+
+    return False
+
 # ─── SCAN DIRECTORY ───────────────────────────────────────────
-def scan_directory(target_url, directory, extensions, save):
+def scan_directory(target_url, directory, extensions):
     global progress_count
 
     paths = [directory]
@@ -50,6 +91,10 @@ def scan_directory(target_url, directory, extensions, save):
                     'cyan'
                 ))
                 sys.stdout.flush()
+
+                # Skip false positives
+                if status == 200 and is_false_positive(response):
+                    return
 
                 if status == 200:
                     msg = f"[200] FOUND:     {full_url}"
@@ -75,10 +120,10 @@ def scan_directory(target_url, directory, extensions, save):
             pass
 
 # ─── WORKER THREAD ────────────────────────────────────────────
-def worker(target_url, queue, extensions, save):
+def worker(target_url, queue, extensions):
     while not queue.empty():
         directory = queue.get()
-        scan_directory(target_url, directory, extensions, save)
+        scan_directory(target_url, directory, extensions)
         queue.task_done()
 
 # ─── SAVE RESULTS ─────────────────────────────────────────────
@@ -87,7 +132,7 @@ def save_results(target_url):
     domain = target_url.replace('http://', '').replace('https://', '').replace('/', '_')
     filename = f"dirscan_{domain}_{timestamp}.txt"
     with open(filename, 'w') as f:
-        f.write(f"Scyfix Directory Scanner Results\n")
+        f.write(f"Scyfix Directory Scanner v2.1 Results\n")
         f.write(f"Target: {target_url}\n")
         f.write(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("=" * 60 + "\n\n")
@@ -118,15 +163,18 @@ def main():
         print(colored(f"[-] Wordlist not found: {wordlist}", 'red'))
         return
 
+    # Get baseline before scanning
+    baseline_status = get_baseline(target_url)
+
     total_count = len(directories) * (1 + len(extensions))
 
     queue = Queue()
     for directory in directories:
         queue.put(directory)
 
-    print(colored(f"\n[*] Target:    {target_url}", 'cyan'))
-    print(colored(f"[*] Wordlist:  {len(directories)} entries", 'cyan'))
-    print(colored(f"[*] Threads:   {threads}", 'cyan'))
+    print(colored(f"\n[*] Target:     {target_url}", 'cyan'))
+    print(colored(f"[*] Wordlist:   {len(directories)} entries", 'cyan'))
+    print(colored(f"[*] Threads:    {threads}", 'cyan'))
     print(colored(f"[*] Extensions: {extensions if extensions else 'none'}", 'cyan'))
     print(colored(f"[*] Scan started at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
     print(colored("=" * 55, 'cyan'))
@@ -135,7 +183,7 @@ def main():
     for _ in range(threads):
         t = threading.Thread(
             target=worker,
-            args=(target_url, queue, extensions, save)
+            args=(target_url, queue, extensions)
         )
         t.daemon = True
         t.start()
