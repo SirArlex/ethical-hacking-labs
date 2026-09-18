@@ -10,11 +10,25 @@ from queue import Queue
 def print_banner():
     print(colored("""
 ╔═══════════════════════════════════════════════════╗
-║         SCYFIX DIRECTORY SCANNER v2.1             ║
+║         SCYFIX DIRECTORY SCANNER v2.2             ║
 ║   Web Directory & Path Discovery Tool             ║
-║      Now with SPA False Positive Detection        ║
+║      Now with Smart Wordlist Defaults             ║
 ╚═══════════════════════════════════════════════════╝
 """, 'cyan'))
+
+# ─── DEFAULT WORDLISTS ────────────────────────────────────────
+DEFAULT_WORDLISTS = [
+    '/usr/share/dirb/wordlists/common.txt',
+    '/usr/share/wordlists/dirb/common.txt',
+    '/usr/share/dirbuster/wordlists/directory-list-2.3-small.txt',
+]
+
+def get_default_wordlist():
+    import os
+    for path in DEFAULT_WORDLISTS:
+        if os.path.exists(path):
+            return path
+    return None
 
 # ─── GLOBALS ──────────────────────────────────────────────────
 found_directories = []
@@ -36,7 +50,6 @@ def get_baseline(target_url):
     global baseline_length, baseline_body
     print(colored("\n[*] Fetching baseline response for false positive detection...", 'cyan'))
     try:
-        # Request a random path that definitely doesn't exist
         fake_url = target_url + '/scyfix_baseline_check_xyz_12345'
         response = requests.get(fake_url, timeout=5, allow_redirects=False)
         baseline_length = len(response.content)
@@ -55,18 +68,12 @@ def get_baseline(target_url):
 def is_false_positive(response):
     if baseline_length is None:
         return False
-
     response_length = len(response.content)
     length_diff = abs(response_length - baseline_length)
-
-    # If response length is within 50 bytes of baseline it's likely a false positive
     if length_diff < 50:
         return True
-
-    # If response body starts the same as baseline it's likely the same page
     if baseline_body and response.text[:500] == baseline_body:
         return True
-
     return False
 
 # ─── SCAN DIRECTORY ───────────────────────────────────────────
@@ -92,7 +99,6 @@ def scan_directory(target_url, directory, extensions):
                 ))
                 sys.stdout.flush()
 
-                # Skip false positives
                 if status == 200 and is_false_positive(response):
                     return
 
@@ -132,7 +138,7 @@ def save_results(target_url):
     domain = target_url.replace('http://', '').replace('https://', '').replace('/', '_')
     filename = f"dirscan_{domain}_{timestamp}.txt"
     with open(filename, 'w') as f:
-        f.write(f"Scyfix Directory Scanner v2.1 Results\n")
+        f.write(f"Scyfix Directory Scanner v2.2 Results\n")
         f.write(f"Target: {target_url}\n")
         f.write(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("=" * 60 + "\n\n")
@@ -147,11 +153,23 @@ def main():
     print_banner()
 
     target_url = input(colored("[*] Enter target URL: ", 'cyan'))
-    wordlist = input(colored("[*] Enter path to wordlist file: ", 'cyan'))
+
+    # Smart wordlist default
+    default_wordlist = get_default_wordlist()
+    if default_wordlist:
+        print(colored(f"  [+] Default wordlist found: {default_wordlist}", 'green'))
+        wordlist_input = input(colored(f"[*] Press ENTER to use default or type a custom path: ", 'cyan')).strip()
+        wordlist = wordlist_input if wordlist_input else default_wordlist
+    else:
+        print(colored("  [!] No default wordlist found on this system", 'yellow'))
+        wordlist = input(colored("[*] Enter path to wordlist file: ", 'cyan')).strip()
+
     threads = input(colored("[*] Number of threads (default 10): ", 'cyan'))
     threads = int(threads) if threads.strip() else 10
+
     ext_input = input(colored("[*] File extensions to check e.g. php,html,txt (leave blank to skip): ", 'cyan'))
     extensions = [e.strip() for e in ext_input.split(',')] if ext_input.strip() else []
+
     save = input(colored("[*] Save results to file? (y/n): ", 'cyan')).lower()
 
     target_url = normalize_url(target_url)
@@ -163,17 +181,15 @@ def main():
         print(colored(f"[-] Wordlist not found: {wordlist}", 'red'))
         return
 
-    # Get baseline before scanning
-    baseline_status = get_baseline(target_url)
+    get_baseline(target_url)
 
     total_count = len(directories) * (1 + len(extensions))
-
     queue = Queue()
     for directory in directories:
         queue.put(directory)
 
     print(colored(f"\n[*] Target:     {target_url}", 'cyan'))
-    print(colored(f"[*] Wordlist:   {len(directories)} entries", 'cyan'))
+    print(colored(f"[*] Wordlist:   {wordlist} ({len(directories)} entries)", 'cyan'))
     print(colored(f"[*] Threads:    {threads}", 'cyan'))
     print(colored(f"[*] Extensions: {extensions if extensions else 'none'}", 'cyan'))
     print(colored(f"[*] Scan started at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
@@ -181,10 +197,7 @@ def main():
 
     thread_list = []
     for _ in range(threads):
-        t = threading.Thread(
-            target=worker,
-            args=(target_url, queue, extensions)
-        )
+        t = threading.Thread(target=worker, args=(target_url, queue, extensions))
         t.daemon = True
         t.start()
         thread_list.append(t)
