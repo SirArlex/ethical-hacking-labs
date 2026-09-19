@@ -12,8 +12,9 @@ from termcolor import colored
 def print_banner():
     print(colored("""
 ╔═══════════════════════════════════════════════════╗
-║           SCYFIX RECON TOOL v1.0                  ║
+║           SCYFIX RECON TOOL v1.1                  ║
 ║      Passive Web Reconnaissance Scanner           ║
+║         Now with Domain Locking                   ║
 ╚═══════════════════════════════════════════════════╝
 """, 'cyan'))
 
@@ -116,6 +117,11 @@ def discover_links(soup, base_url, path, urls, scraped_urls):
             link = base_url + link
         elif not link.startswith('http'):
             link = path + link
+
+        # Only follow links on the same domain
+        if not link.startswith(base_url):
+            continue
+
         if link not in urls and link not in scraped_urls:
             urls.append(link)
 
@@ -150,11 +156,16 @@ def main():
         'js_files': [],
     }
 
+    # Extract base URL for domain locking
+    parts = urllib.parse.urlsplit(target_url)
+    base_url = f"{parts.scheme}://{parts.netloc}"
+
     urls = deque([target_url])
     scraped_urls = set()
     count = 0
 
     print(colored(f"\n[*] Starting recon on {target_url}", 'cyan'))
+    print(colored(f"[*] Locked to domain: {base_url}", 'cyan'))
     print(colored(f"[*] Max pages: {max_pages}\n", 'cyan'))
     print(colored("=" * 55, 'cyan'))
 
@@ -166,7 +177,6 @@ def main():
             url = urls.popleft()
             scraped_urls.add(url)
             parts = urllib.parse.urlsplit(url)
-            base_url = f"{parts.scheme}://{parts.netloc}"
             path = url[:url.rfind('/') + 1] if '/' in parts.path else url
 
             print(colored(f"\n[{count}/{max_pages}] Scanning: {url}", 'cyan'))
