@@ -23,9 +23,22 @@ DEFAULT_WORDLISTS = [
     '/usr/share/dirb/wordlists/common.txt',
 ]
 
+DEFAULT_USERLISTS = [
+    '/usr/share/wordlists/metasploit/unix_users.txt',
+    '/usr/share/wordlists/metasploit/default_userpass_for_services_unhashed.txt',
+    '/usr/share/seclists/Usernames/top-usernames-shortlist.txt',
+]
+
 
 def get_default_wordlist():
     for path in DEFAULT_WORDLISTS:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def get_default_userlist():
+    for path in DEFAULT_USERLISTS:
         if os.path.exists(path):
             return path
     return None
@@ -42,12 +55,56 @@ def prompt_wordlist():
         return input(colored("[*] Enter path to password file: ", 'cyan')).strip()
 
 
+def prompt_usernames():
+    """
+    Accepts either:
+    - Comma separated usernames: admin,root,ftp
+    - Path to a username wordlist file: /path/to/users.txt
+    Returns a list of usernames.
+    """
+    default_ul = get_default_userlist()
+    if default_ul:
+        print(colored(f"  [+] Default username list found: {default_ul}", 'green'))
+
+    print(colored("[*] Enter username(s), comma separated, or path to a username file", 'cyan'))
+    if default_ul:
+        print(colored(f"    Press ENTER to use default username list", 'cyan'))
+
+    user_input = input(colored("[*] Usernames / file path: ", 'cyan')).strip()
+
+    # Empty input — use default userlist
+    if not user_input and default_ul:
+        print(colored(f"  [+] Using default username list: {default_ul}", 'green'))
+        return load_userlist(default_ul)
+
+    # Check if it's a file path
+    if os.path.exists(user_input):
+        print(colored(f"  [+] Loading usernames from file: {user_input}", 'green'))
+        return load_userlist(user_input)
+
+    # Otherwise treat as comma separated usernames
+    usernames = [u.strip() for u in user_input.split(',') if u.strip()]
+    print(colored(f"  [+] Usernames: {usernames}", 'green'))
+    return usernames
+
+
+def load_userlist(filepath):
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            users = [line.strip() for line in f if line.strip()]
+        print(colored(f"  [+] Loaded {len(users)} usernames", 'green'))
+        return users
+    except FileNotFoundError:
+        print(colored(f"[-] Username file not found: {filepath}", 'red'))
+        return []
+
+
 def print_banner():
     print(colored("""
 ╔═══════════════════════════════════════════════════╗
-║         SCYFIX BRUTE FORCER v3.0                  ║
+║         SCYFIX BRUTE FORCER v3.1                  ║
 ║   Multi-Protocol Authentication Testing Tool      ║
-║      Web | SSH | FTP | CSRF Support               ║
+║   Web | SSH | FTP | CSRF | Username Wordlists     ║
 ╚═══════════════════════════════════════════════════╝
 """, 'cyan'))
 
@@ -196,6 +253,7 @@ def ssh_attack(host, port, usernames, password_file, delay):
         return None
 
     print(colored(f"\n[*] Starting SSH attack on {host}:{port}", 'cyan'))
+    print(colored(f"[*] Usernames to try: {len(usernames)}", 'cyan'))
     try:
         with open(password_file, 'r', encoding='utf-8', errors='ignore') as f:
             passwords = f.read().splitlines()
@@ -211,7 +269,7 @@ def ssh_attack(host, port, usernames, password_file, delay):
         for count, password in enumerate(passwords, 1):
             password = password.strip()
             sys.stdout.write(colored(
-                f"\r  [*] Trying ({count}/{total}): {password:<30}", 'red'))
+                f"\r  [*] Trying ({count}/{total}): {username}:{password:<30}", 'red'))
             sys.stdout.flush()
 
             client = paramiko.SSHClient()
@@ -245,6 +303,7 @@ def ssh_attack(host, port, usernames, password_file, delay):
 
 def ftp_attack(host, port, usernames, password_file, delay):
     print(colored(f"\n[*] Starting FTP attack on {host}:{port}", 'cyan'))
+    print(colored(f"[*] Usernames to try: {len(usernames)}", 'cyan'))
     try:
         with open(password_file, 'r', encoding='utf-8', errors='ignore') as f:
             passwords = f.read().splitlines()
@@ -260,7 +319,7 @@ def ftp_attack(host, port, usernames, password_file, delay):
         for count, password in enumerate(passwords, 1):
             password = password.strip()
             sys.stdout.write(colored(
-                f"\r  [*] Trying ({count}/{total}): {password:<30}", 'red'))
+                f"\r  [*] Trying ({count}/{total}): {username}:{password:<30}", 'red'))
             sys.stdout.flush()
             try:
                 ftp = ftplib.FTP()
@@ -343,7 +402,7 @@ def run_web_attack(mode, url, usernames, fail_string, delay):
             for count, password in enumerate(passwords, 1):
                 password = password.strip()
                 sys.stdout.write(colored(
-                    f"\r  [*] Trying ({count}/{total}): {password:<30}", 'red'))
+                    f"\r  [*] Trying ({count}/{total}): {username}:{password:<30}", 'red'))
                 sys.stdout.flush()
                 if web_attempt_login(url, session, method, action, all_fields, username_field,
                                      password_field, username, password, fail_string, delay, csrf_field):
@@ -360,7 +419,7 @@ def run_web_attack(mode, url, usernames, fail_string, delay):
             print(colored(f"\n[*] Pattern attack on username: {username}", 'yellow'))
             for count, password in enumerate(patterns, 1):
                 sys.stdout.write(colored(
-                    f"\r  [*] Trying ({count}/{total}): {password:<30}", 'red'))
+                    f"\r  [*] Trying ({count}/{total}): {username}:{password:<30}", 'red'))
                 sys.stdout.flush()
                 if web_attempt_login(url, session, method, action, all_fields, username_field,
                                      password_field, username, password, fail_string, delay, csrf_field):
@@ -388,7 +447,8 @@ def run_web_attack(mode, url, usernames, fail_string, delay):
             for length in range(min_len, max_len + 1):
                 for combo in itertools.product(charset, repeat=length):
                     password = ''.join(combo)
-                    sys.stdout.write(colored(f"\r  [*] Trying: {password:<20}", 'red'))
+                    sys.stdout.write(colored(
+                        f"\r  [*] Trying: {username}:{password:<20}", 'red'))
                     sys.stdout.flush()
                     if web_attempt_login(url, session, method, action, all_fields, username_field,
                                          password_field, username, password, fail_string, delay, csrf_field):
@@ -421,8 +481,7 @@ def main():
 
     if mode in ['1', '2', '3', '4']:
         url = input(colored("[*] Enter target login URL: ", 'cyan'))
-        usernames_input = input(colored("[*] Enter username(s) (comma separated): ", 'cyan'))
-        usernames = [u.strip() for u in usernames_input.split(',')]
+        usernames = prompt_usernames()
         fail_string = input(colored("[*] Enter string that appears when login FAILS: ", 'cyan'))
         delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
         delay = float(delay) if delay.strip() else 0.5
@@ -432,8 +491,7 @@ def main():
         host = input(colored("[*] Enter target host/IP: ", 'cyan'))
         port = input(colored("[*] Enter port (default 22): ", 'cyan'))
         port = int(port) if port.strip() else 22
-        usernames_input = input(colored("[*] Enter username(s) (comma separated): ", 'cyan'))
-        usernames = [u.strip() for u in usernames_input.split(',')]
+        usernames = prompt_usernames()
         delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
         delay = float(delay) if delay.strip() else 0.5
         password_file = prompt_wordlist()
@@ -443,8 +501,7 @@ def main():
         host = input(colored("[*] Enter target host/IP: ", 'cyan'))
         port = input(colored("[*] Enter port (default 21): ", 'cyan'))
         port = int(port) if port.strip() else 21
-        usernames_input = input(colored("[*] Enter username(s) (comma separated): ", 'cyan'))
-        usernames = [u.strip() for u in usernames_input.split(',')]
+        usernames = prompt_usernames()
         delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
         delay = float(delay) if delay.strip() else 0.5
         password_file = prompt_wordlist()
@@ -458,8 +515,7 @@ def main():
         if protocol == 'unknown':
             print(colored("[-] Could not detect protocol -- exiting", 'red'))
             return
-        usernames_input = input(colored("[*] Enter username(s) (comma separated): ", 'cyan'))
-        usernames = [u.strip() for u in usernames_input.split(',')]
+        usernames = prompt_usernames()
         delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
         delay = float(delay) if delay.strip() else 0.5
         password_file = prompt_wordlist()
