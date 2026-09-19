@@ -1,61 +1,81 @@
-# Scyfix Ethical Hacking Labs
+# Scyfix Security Testing Toolkit
 
-A collection of Python-based penetration testing and reconnaissance tools built for educational purposes and authorised security assessments. These tools were developed as part of hands-on ethical hacking practice — each one tested against real vulnerable environments including DVWA and Metasploitable 2.
-
----
-
-## Tools Included
-
-### Port Scanner
-A fast, multi-feature TCP port scanner with service detection and banner grabbing. Supports single and multiple targets simultaneously.
-
-### Web Tools
-A suite of three web-focused security tools:
-
-**Brute Forcer** — Web login brute force tool with dynamic form detection, CSRF token support, wordlist attack, pattern attack, and character brute force modes.
-
-**Directory Scanner** — Multi-threaded web directory and path discovery tool with status code awareness, extension scanning, and colour coded output.
-
-**Recon Tool** — Passive web reconnaissance scanner that extracts emails, analyses response headers, detects missing security headers, finds HTML comments, maps forms, and discovers JavaScript files.
+A collection of Python-based penetration testing tools, installable as global commands. Built for educational purposes and authorised security assessments, and tested against DVWA and Metasploitable 2.
 
 ---
 
-## Lab Environment
+## Tools
 
-All tools were developed and tested in an isolated VirtualBox lab environment:
-
-- **Attack Machine:** Kali Linux
-- **Target Machine:** Metasploitable 2
-- **Network:** Host-Only Adapter (isolated, no internet exposure)
-- **Additional Target:** DVWA (Damn Vulnerable Web Application)
+| Command | Tool | Description |
+|---------|------|-------------|
+| `scyfix-port` | Port Scanner | TCP port scanner with service detection and banner grabbing |
+| `scyfix-brute` | Brute Forcer | Multi-protocol authentication tester — Web, SSH, FTP |
+| `scyfix-scan` | Directory Scanner | Multi-threaded directory discovery with SPA false-positive detection |
+| `scyfix-recon` | Recon Tool | Passive web reconnaissance — emails, headers, forms, JS files |
 
 ---
 
-## Requirements
+## Installation
 
-Install all dependencies with:
+Clone the repository and install as an editable package:
 
 ```bash
-pip install requests beautifulsoup4 termcolor lxml
+git clone https://github.com/SirArlex/ethical-hacking-labs.git
+cd ethical-hacking-labs
+pip install -e . --break-system-packages
 ```
+
+Once installed, the four commands are available system-wide. Because it is installed in editable mode, any updates pulled from GitHub take effect immediately without reinstalling:
+
+```bash
+git pull
+```
+
+---
+
+## Usage
+
+After installation, run any tool from anywhere in your terminal:
+
+```bash
+scyfix-port      # Port scanner
+scyfix-brute     # Brute forcer (Web / SSH / FTP)
+scyfix-scan      # Directory scanner
+scyfix-recon     # Recon tool
+```
+
+Each tool is interactive and will prompt for the required inputs.
+
+---
+
+## Brute Forcer Modes (v3.0)
+
+The brute forcer now supports multiple protocols:
+
+- **Mode 1-4** — Web login forms (wordlist, pattern, character brute force, or all)
+- **Mode 5** — SSH brute force
+- **Mode 6** — FTP brute force
+- **Mode 7** — Auto-detect protocol (SSH or FTP) and attack
+
+Web mode includes dynamic form detection, CSRF token handling, and multiple attack strategies.
+
+---
+
+## Dependencies
+
+Installed automatically with the package:
+
+- requests
+- beautifulsoup4
+- termcolor
+- lxml
+- paramiko (for SSH support)
 
 ---
 
 ## Legal Disclaimer
 
-These tools are intended for educational purposes and authorised penetration testing only. Only use these tools on systems you own or have explicit written permission to test. Unauthorised scanning or attacking of systems is illegal and unethical. The author takes no responsibility for misuse of these tools.
-
----
-
-## Skills Demonstrated
-
-- TCP socket programming and network reconnaissance
-- HTTP request handling and session management
-- Dynamic HTML form parsing and CSRF token handling
-- Multi-threaded network scanning
-- Web application security testing methodology
-- Python security tooling and scripting
-- Penetration testing lab setup and operation
+These tools are intended for educational purposes and authorised penetration testing only. Only use them on systems you own or have explicit written permission to test. Unauthorised use is illegal.
 
 ---
 

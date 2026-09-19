@@ -1,0 +1,221 @@
+import requests
+import requests.exceptions
+from termcolor import colored
+from datetime import datetime
+import sys
+import threading
+from queue import Queue
+import os
+
+DEFAULT_WORDLISTS = [
+    '/usr/share/dirb/wordlists/common.txt',
+    '/usr/share/wordlists/dirb/common.txt',
+    '/usr/share/dirbuster/wordlists/directory-list-2.3-small.txt',
+]
+
+found_directories = []
+lock = threading.Lock()
+progress_count = 0
+total_count = 0
+baseline_length = None
+baseline_body = None
+
+
+def print_banner():
+    print(colored("""
+╔═══════════════════════════════════════════════════╗
+║         SCYFIX DIRECTORY SCANNER v2.2             ║
+║   Web Directory & Path Discovery Tool             ║
+║      Smart Wordlist + SPA Detection               ║
+╚═══════════════════════════════════════════════════╝
+""", 'cyan'))
+
+
+def get_default_wordlist():
+    for path in DEFAULT_WORDLISTS:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def normalize_url(url):
+    url = url.strip()
+    if not url.startswith('http://') and not url.startswith('https://'):
+        url = 'http://' + url
+    return url.rstrip('/')
+
+
+def get_baseline(target_url):
+    global baseline_length, baseline_body
+    print(colored("\n[*] Fetching baseline response for false positive detection...", 'cyan'))
+    try:
+        fake_url = target_url + '/scyfix_baseline_check_xyz_12345'
+        response = requests.get(fake_url, timeout=5, allow_redirects=False)
+        baseline_length = len(response.content)
+        baseline_body = response.text[:500]
+        print(colored(f"  [+] Baseline status code: {response.status_code}", 'green'))
+        print(colored(f"  [+] Baseline response length: {baseline_length} bytes", 'green'))
+        if response.status_code == 200:
+            print(colored("  [!] Target returns 200 for non-existent paths -- SPA detected", 'yellow'))
+            print(colored("  [!] False positive filtering enabled", 'yellow'))
+        return response.status_code
+    except Exception as e:
+        print(colored(f"  [-] Could not fetch baseline: {e}", 'red'))
+        return None
+
+
+def is_false_positive(response):
+    if baseline_length is None:
+        return False
+    response_length = len(response.content)
+    length_diff = abs(response_length - baseline_length)
+    if length_diff < 50:
+        return True
+    if baseline_body and response.text[:500] == baseline_body:
+        return True
+    return False
+
+
+def scan_directory(target_url, directory, extensions):
+    global progress_count
+    paths = [directory]
+    for ext in extensions:
+        paths.append(directory + '.' + ext)
+
+    for path in paths:
+        full_url = target_url + '/' + path
+        try:
+            response = requests.get(full_url, timeout=5, allow_redirects=False)
+            status = response.status_code
+            with lock:
+                progress_count += 1
+                sys.stdout.write(colored(
+                    f"\r  [*] Progress: {progress_count}/{total_count} | Trying: {path:<40}",
+                    'cyan'
+                ))
+                sys.stdout.flush()
+
+                if status == 200 and is_false_positive(response):
+                    return
+
+                if status == 200:
+                    msg = f"[200] FOUND:     {full_url}"
+                    print(colored(f"\n  [+] {msg}", 'green'))
+                    found_directories.append(msg)
+                elif status == 301 or status == 302:
+                    location = response.headers.get('Location', 'unknown')
+                    msg = f"[{status}] REDIRECT:  {full_url} --> {location}"
+                    print(colored(f"\n  [~] {msg}", 'yellow'))
+                    found_directories.append(msg)
+                elif status == 403:
+                    msg = f"[403] FORBIDDEN: {full_url}"
+                    print(colored(f"\n  [!] {msg}", 'red'))
+                    found_directories.append(msg)
+                elif status == 500:
+                    msg = f"[500] SERVER ERROR: {full_url}"
+                    print(colored(f"\n  [!] {msg}", 'red'))
+                    found_directories.append(msg)
+
+        except requests.exceptions.ConnectionError:
+            pass
+        except requests.exceptions.Timeout:
+            pass
+
+
+def worker(target_url, queue, extensions):
+    while not queue.empty():
+        directory = queue.get()
+        scan_directory(target_url, directory, extensions)
+        queue.task_done()
+
+
+def save_results(target_url):
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    domain = target_url.replace('http://', '').replace('https://', '').replace('/', '_')
+    filename = f"dirscan_{domain}_{timestamp}.txt"
+    with open(filename, 'w') as f:
+        f.write(f"Scyfix Directory Scanner v2.2 Results\n")
+        f.write(f"Target: {target_url}\n")
+        f.write(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 60 + "\n\n")
+        for entry in found_directories:
+            f.write(entry + "\n")
+    print(colored(f"\n[*] Results saved to {filename}", 'cyan'))
+
+
+def main():
+    global total_count
+    print_banner()
+
+    target_url = input(colored("[*] Enter target URL: ", 'cyan'))
+
+    default_wordlist = get_default_wordlist()
+    if default_wordlist:
+        print(colored(f"  [+] Default wordlist found: {default_wordlist}", 'green'))
+        wordlist_input = input(colored("[*] Press ENTER to use default or type a custom path: ", 'cyan')).strip()
+        wordlist = wordlist_input if wordlist_input else default_wordlist
+    else:
+        print(colored("  [!] No default wordlist found on this system", 'yellow'))
+        wordlist = input(colored("[*] Enter path to wordlist file: ", 'cyan')).strip()
+
+    threads = input(colored("[*] Number of threads (default 10): ", 'cyan'))
+    threads = int(threads) if threads.strip() else 10
+
+    ext_input = input(colored("[*] File extensions to check e.g. php,html,txt (leave blank to skip): ", 'cyan'))
+    extensions = [e.strip() for e in ext_input.split(',')] if ext_input.strip() else []
+
+    save = input(colored("[*] Save results to file? (y/n): ", 'cyan')).lower()
+
+    target_url = normalize_url(target_url)
+
+    try:
+        with open(wordlist, 'r', encoding='utf-8', errors='ignore') as f:
+            directories = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        print(colored(f"[-] Wordlist not found: {wordlist}", 'red'))
+        return
+
+    get_baseline(target_url)
+
+    total_count = len(directories) * (1 + len(extensions))
+    queue = Queue()
+    for directory in directories:
+        queue.put(directory)
+
+    print(colored(f"\n[*] Target:     {target_url}", 'cyan'))
+    print(colored(f"[*] Wordlist:   {wordlist} ({len(directories)} entries)", 'cyan'))
+    print(colored(f"[*] Threads:    {threads}", 'cyan'))
+    print(colored(f"[*] Extensions: {extensions if extensions else 'none'}", 'cyan'))
+    print(colored(f"[*] Scan started at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
+    print(colored("=" * 55, 'cyan'))
+
+    thread_list = []
+    for _ in range(threads):
+        t = threading.Thread(target=worker, args=(target_url, queue, extensions))
+        t.daemon = True
+        t.start()
+        thread_list.append(t)
+
+    for t in thread_list:
+        t.join()
+
+    print(colored(f"\n\n[*] Scan completed at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
+    print(colored("=" * 55, 'cyan'))
+    print(colored(f"[*] Total found: {len(found_directories)}", 'green'))
+
+    if found_directories:
+        print(colored("\n[*] Summary of findings:", 'cyan'))
+        for entry in found_directories:
+            if entry.startswith('[200]'):
+                print(colored(f"  {entry}", 'green'))
+            elif entry.startswith('[403]') or entry.startswith('[500]'):
+                print(colored(f"  {entry}", 'red'))
+            else:
+                print(colored(f"  {entry}", 'yellow'))
+
+    if save == 'y':
+        save_results(target_url)
+
+
+if __name__ == "__main__":
+    main()
