@@ -17,6 +17,33 @@ try:
 except ImportError:
     PARAMIKO_AVAILABLE = False
 
+BLOCK_INDICATORS = [
+    'ip has been blocked',
+    'you have been blocked',
+    'access denied',
+    'too many requests',
+    'rate limit',
+    'rate-limit',
+    'temporarily locked',
+    'account locked',
+    'ip blocked',
+    'banned',
+    'captcha',
+    'unusual activity',
+    'suspicious activity',
+    'try again later',
+    'please wait',
+    'service unavailable',
+    '429',
+]
+
+
+def is_blocked_response(response_text):
+    """Return True if the response looks like an IP block or rate-limit page."""
+    lower = response_text.lower()
+    return any(indicator in lower for indicator in BLOCK_INDICATORS)
+
+
 DEFAULT_WORDLISTS = [
     '/usr/share/wordlists/rockyou.txt',
     '/usr/share/wordlists/rockyou.txt.gz',
@@ -225,6 +252,9 @@ def web_attempt_login(url, session, method, action, fields, username_field,
             response = session.get(action, params=fields, timeout=10,
                                    allow_redirects=True, headers=headers)
         time.sleep(delay)
+        if is_blocked_response(response.text):
+            print(colored(f"\n[!] Block/rate-limit detected -- skipping attempt", 'yellow'))
+            return False
         return fail_string not in response.text
     except requests.exceptions.ConnectionError:
         print(colored("\n[!] Connection error -- target may be blocking requests", 'red'))
@@ -445,7 +475,9 @@ def username_enum(url, username_file, fail_string, password, delay, use_xff):
                                        allow_redirects=True, headers=headers)
             time.sleep(delay)
 
-            if fail_string not in response.text:
+            if is_blocked_response(response.text):
+                print(colored(f"\n[!] Block/rate-limit detected -- skipping {username}", 'yellow'))
+            elif fail_string not in response.text:
                 print(colored(f"\n  [!] VALID USERNAME FOUND: {username}", 'green'))
                 valid_usernames.append(username)
 
