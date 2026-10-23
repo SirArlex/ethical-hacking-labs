@@ -234,7 +234,25 @@ def identify_fields(fields, submit_fields):
 
 def web_attempt_login(url, session, method, action, fields, username_field,
                       password_field, username, password, fail_string, delay, csrf_field,
-                      xff_ip=None):
+                      xff_ip=None, success_string=None):
+    """
+    Returns True ONLY on a positively-confirmed login success.
+
+    Deciding success by "fail_string is absent" is unsafe: a login page
+    has at least three response types -- success, invalid credentials,
+    and locked/blocked -- and a lockout page contains neither the fail
+    string nor, unless its exact wording happens to be in BLOCK_INDICATORS,
+    a recognised block phrase. So "fail_string absent" wrongly fires on it.
+
+    Instead we require a POSITIVE signal:
+      - a locked/blocked response is never a success (checked first), and
+      - success means either an explicit success_string is present, or
+        (no success_string given) the request redirected AWAY from the
+        login page -- a genuine login on these labs returns 302 to an
+        authenticated page, while invalid/locked attempts stay put with 200.
+    fail_string, when provided, is an extra veto on top, never the sole
+    basis for a True.
+    """
     if csrf_field:
         fresh_token = get_fresh_token(url, session, csrf_field)
         if fresh_token:
@@ -254,10 +272,25 @@ def web_attempt_login(url, session, method, action, fields, username_field,
             response = session.get(action, params=fields, timeout=10,
                                    allow_redirects=True, headers=headers)
         time.sleep(delay)
+
+        # A locked / rate-limited / blocked response is NEVER a success.
         if is_blocked_response(response.text):
-            print(colored(f"\n[!] Block/rate-limit detected -- skipping attempt", 'yellow'))
+            print(colored(f"\n[!] Block/lockout detected -- not a success, skipping attempt", 'yellow'))
             return False
-        return fail_string not in response.text
+
+        # An explicit fail string, when given, vetoes success.
+        if fail_string and fail_string in response.text:
+            return False
+
+        # Positive confirmation required from here on.
+        if success_string:
+            return success_string in response.text
+
+        # No success_string: trust a redirect away from the login page.
+        # A genuine login returns 302 -> authenticated page; invalid and
+        # locked attempts stay on the login page with 200 and no redirect.
+        redirected = len(response.history) > 0 and response.url.rstrip('/') != action.rstrip('/')
+        return redirected
     except requests.exceptions.ConnectionError:
         print(colored("\n[!] Connection error -- target may be blocking requests", 'red'))
         time.sleep(5)
